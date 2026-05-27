@@ -811,6 +811,14 @@ def _get_provider(stt_config: dict) -> str:
             )
             return "none"
 
+        if provider == "xiaomi":
+            if _has_xiaomi_stt():
+                return "xiaomi"
+            logger.warning(
+                "STT provider 'xiaomi' configured but XIAOMI_API_KEY not set"
+            )
+            return "none"
+
         return provider  # Unknown — let it fail downstream
 
     # --- Auto-detect (no explicit provider): local > groq > openai > xai ---
@@ -1570,6 +1578,11 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         model_name = model or "grok-stt"
         return _transcribe_xai(file_path, model_name)
 
+    if provider == "xiaomi":
+        xiaomi_cfg = stt_config.get("xiaomi", {})
+        model_name = model or xiaomi_cfg.get("model", XIAOMI_STT_MODEL)
+        return _transcribe_xiaomi(file_path, model_name)
+
     # User-declared command-type provider
     # (``stt.providers.<name>: type: command``). Fires after the built-in
     # elif chain — built-in names short-circuit upstream so a user's
@@ -1667,3 +1680,133 @@ def _extract_transcript_text(transcription: Any) -> str:
             return value.strip()
 
     return str(transcription).strip()
+
+
+# ---------------------------------------------------------------------------
+# Provider: xiaomi (MiMo chat completions) + fallback to local faster-whisper
+# ---------------------------------------------------------------------------
+
+XIAOMI_STT_BASE_URL = os.getenv("XIAOMI_STT_BASE_URL", "https://api.xiaomimimo.com/v1")
+XIAOMI_STT_MODEL = os.getenv("XIAOMI_STT_MODEL", "mimo-v2.5")
+XIAOMI_STT_PROMPT = os.getenv("XIAOMI_STT_PROMPT", "请转写这段语音的内容。只返回转写后的文字，不要额外说明。")
+
+
+def _has_xiaomi_stt() -> bool:
+    """Check whether Xiaomi MiMo STT credentials are available."""
+    return bool(get_env_value("XIAOMI_API_KEY"))
+
+
+def _transcribe_xiaomi(file_path: str, model_name: str) -> Dict[str, Any]:
+    """Transcribe using Xiaomi MiMo chat completions API with audio input.
+
+    On failure (network, auth, API error), falls back to local faster-whisper.
+
+    Args:
+        file_path:  Absolute path to the audio file.
+        model_name: MiMo model name (e.g. ``mimo-v2.5``).
+
+    Returns:
+        Standard transcription result dict.
+    """
+    import base64
+
+    api_key = get_env_value("XIAOMI_API_KEY")
+    if not api_key:
+        logger.info("XIAOMI_API_KEY not set — falling back to local STT")
+        return _local_fallback(file_path)
+
+    stt_config = _load_stt_config()
+    xiaomi_cfg = stt_config.get("xiaomi", {})
+    base_url = xiaomi_cfg.get("base_url", XIAOMI_STT_BASE_URL).rstrip("/")
+    prompt = xiaomi_cfg.get("prompt", XIAOMI_STT_PROMPT)
+    timeout = int(xiaomi_cfg.get("timeout", 30))
+
+    # Read and encode the audio file
+    try:
+        audio_path = Path(file_path)
+        suffix = audio_path.suffix.lower().lstrip(".")
+        # Map common extensions to format strings expected by MiMo API
+        fmt_map = {"mp3": "mp3", "wav": "wav", "ogg": "ogg", "m4a": "m4a",
+                   "aac": "aac", "flac": "flac", "webm": "webm"}
+        audio_format = fmt_map.get(suffix, "wav")
+        with open(file_path, "rb") as f:
+            audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+    except Exception as e:
+        logger.error("Failed to read audio file for MiMo STT: %s", e)
+        return _local_fallback(file_path)
+
+    # Call MiMo chat completions with input_audio content
+    try:
+        import requests as _requests
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": model_name,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": f"data:audio/{audio_format};base64,{audio_b64}",
+                                "format": audio_format,
+                            },
+                        },
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ],
+            "max_tokens": 512,
+        }
+
+        logger.debug("Calling MiMo STT via %s/chat/completions (model=%s)", base_url, model_name)
+        resp = _requests.post(
+            f"{base_url}/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        choices = data.get("choices", [])
+        if not choices:
+            logger.warning("MiMo STT: no choices in response — falling back to local")
+            return _local_fallback(file_path)
+
+        transcript = choices[0].get("message", {}).get("content", "").strip()
+        if not transcript:
+            logger.warning("MiMo STT: empty transcript — falling back to local")
+            return _local_fallback(file_path)
+
+        # Calculate audio tokens for logging
+        usage = data.get("usage", {})
+        audio_tokens = (
+            usage.get("prompt_tokens_details", {}).get("audio_tokens", 0)
+        )
+
+        logger.info(
+            "Transcribed %s via MiMo (%s, %d chars, %d audio tokens)",
+            Path(file_path).name, model_name, len(transcript), audio_tokens,
+        )
+        return {"success": True, "transcript": transcript, "provider": "xiaomi"}
+
+    except Exception as e:
+        logger.warning(
+            "MiMo STT failed (%s: %s) — falling back to local faster-whisper",
+            type(e).__name__, e,
+        )
+        return _local_fallback(file_path)
+
+
+def _local_fallback(file_path: str) -> Dict[str, Any]:
+    """Fallback: transcribe via local faster-whisper."""
+    stt_config = _load_stt_config()
+    local_cfg = stt_config.get("local", {})
+    model_name = _normalize_local_model(local_cfg.get("model", DEFAULT_LOCAL_MODEL))
+    logger.info("Falling back to local faster-whisper (model=%s)", model_name)
+    return _transcribe_local(file_path, model_name)

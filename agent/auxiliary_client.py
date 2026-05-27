@@ -1433,6 +1433,8 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
                 extra["default_headers"] = copilot_default_headers()
             elif base_url_host_matches(base_url, "integrate.api.nvidia.com"):
                 extra["default_headers"] = build_nvidia_nim_headers(base_url)
+            elif base_url_host_matches(base_url, "api.xiaomimimo.com"):
+                extra["default_headers"] = {"api-key": api_key}
             else:
                 try:
                     from providers import get_provider_profile as _gpf_aux
@@ -1470,6 +1472,8 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
             extra["default_headers"] = copilot_default_headers()
         elif base_url_host_matches(base_url, "integrate.api.nvidia.com"):
             extra["default_headers"] = build_nvidia_nim_headers(base_url)
+        elif base_url_host_matches(base_url, "api.xiaomimimo.com"):
+            extra["default_headers"] = {"api-key": api_key}
         else:
             try:
                 from providers import get_provider_profile as _gpf_aux2
