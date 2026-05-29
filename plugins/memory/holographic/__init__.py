@@ -288,6 +288,7 @@ class HolographicMemoryProvider(MemoryProvider):
         self._extract_frequency = int(self._config.get("extract_frequency", 10))
         self._turn_count = 0
         self._last_extracted_idx = 0  # index into conversation messages
+        self._extracted_this_turn = False  # guard: has sync_turn already extracted this turn?
 
     @property
     def name(self) -> str:
@@ -351,6 +352,7 @@ class HolographicMemoryProvider(MemoryProvider):
         self._session_id = session_id
         self._turn_count = 0
         self._last_extracted_idx = 0
+        self._extracted_this_turn = False
 
     def system_prompt_block(self) -> str:
         if not self._store:
@@ -392,7 +394,14 @@ class HolographicMemoryProvider(MemoryProvider):
             return ""
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", messages: list | None = None) -> None:
-        """Count turns and trigger LLM extraction periodically."""
+        """Count turns and trigger LLM extraction periodically.
+
+        Lowest priority: only fires when _extract_frequency is reached.
+        Sets _extracted_this_turn so on_pre_compress can skip if we already handled it.
+        """
+        # Reset the turn guard
+        self._extracted_this_turn = False
+
         if not self._llm_extract_enabled or not self._store:
             return
         if self._extract_frequency <= 0:
@@ -409,11 +418,22 @@ class HolographicMemoryProvider(MemoryProvider):
             new_msgs = messages[self._last_extracted_idx:]
             self._run_llm_extraction(new_msgs)
             self._last_extracted_idx = len(messages)
+            self._extracted_this_turn = True
 
     def on_pre_compress(self, messages: list) -> str:
-        """Extract facts before context compression discards messages."""
+        """Extract facts before context compression discards messages.
+
+        Medium priority: skips if sync_turn already extracted this turn.
+        """
         if not self._llm_extract_enabled or not self._store or not messages:
             return ""
+
+        # If periodic extraction already handled this turn, skip
+        if self._extracted_this_turn:
+            self._extracted_this_turn = False  # Reset for next turn
+            logger.debug("Holographic pre-compress skipped: already extracted this turn")
+            return ""
+
         # Run synchronously — we need this before compression
         facts = self._run_llm_extraction(messages)
         if facts:
@@ -431,6 +451,11 @@ class HolographicMemoryProvider(MemoryProvider):
         return tool_error(f"Unknown tool: {tool_name}")
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        """Final extraction at session end.
+
+        Highest priority: ALWAYS extracts remaining messages, regardless of
+        whether sync_turn or on_pre_compress already ran this session.
+        """
         if not self._store or not messages:
             return
         if self._llm_extract_enabled:
