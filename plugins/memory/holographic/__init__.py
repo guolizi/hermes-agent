@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import re
+import threading
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List
@@ -424,6 +425,7 @@ class HolographicMemoryProvider(MemoryProvider):
         """Extract facts before context compression discards messages.
 
         Medium priority: skips if sync_turn already extracted this turn.
+        Runs async (background thread) so it doesn't block compression.
         """
         if not self._llm_extract_enabled or not self._store or not messages:
             return ""
@@ -434,10 +436,19 @@ class HolographicMemoryProvider(MemoryProvider):
             logger.debug("Holographic pre-compress skipped: already extracted this turn")
             return ""
 
-        # Run synchronously — we need this before compression
-        facts = self._run_llm_extraction(messages)
-        if facts:
-            logger.info("Holographic pre-compress extracted %d facts", len(facts))
+        # Fire-and-forget: don't block compression waiting for LLM
+        msgs_copy = list(messages)
+
+        def _extract_async():
+            try:
+                facts = self._run_llm_extraction(msgs_copy)
+                if facts:
+                    logger.info("Holographic pre-compress extracted %d facts", len(facts))
+            except Exception as e:
+                logger.debug("Holographic pre-compress async extraction failed: %s", e)
+
+        t = threading.Thread(target=_extract_async, daemon=True, name="holographic-compress")
+        t.start()
         return ""  # No text to inject into compression prompt
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
