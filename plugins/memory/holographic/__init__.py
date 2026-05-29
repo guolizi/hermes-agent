@@ -286,7 +286,6 @@ class HolographicMemoryProvider(MemoryProvider):
         # Extraction state
         self._llm_extract_enabled = self._config.get("llm_extract", False)
         self._last_extracted_idx = 0  # index into conversation messages
-        self._extracted_this_turn = False  # guard: has sync_turn already extracted this turn?
 
     @property
     def name(self) -> str:
@@ -348,7 +347,6 @@ class HolographicMemoryProvider(MemoryProvider):
         )
         self._session_id = session_id
         self._last_extracted_idx = 0
-        self._extracted_this_turn = False
 
     def system_prompt_block(self) -> str:
         if not self._store:
@@ -390,27 +388,15 @@ class HolographicMemoryProvider(MemoryProvider):
             return ""
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", messages: list | None = None) -> None:
-        """Reset the same-turn extraction guard for the new turn.
-
-        Periodic extraction is not used — extraction only fires on
-        pre-compress and session-end. This reset ensures on_pre_compress
-        doesn't skip a fresh turn thinking it was already handled.
-        """
-        self._extracted_this_turn = False
+        """No-op: extraction only fires on pre-compress and session-end."""
+        pass
 
     def on_pre_compress(self, messages: list) -> str:
         """Extract facts before context compression discards messages.
 
-        Medium priority: skips if sync_turn already extracted this turn.
         Runs async (background thread) so it doesn't block compression.
         """
         if not self._llm_extract_enabled or not self._store or not messages:
-            return ""
-
-        # If periodic extraction already handled this turn, skip
-        if self._extracted_this_turn:
-            self._extracted_this_turn = False  # Reset for next turn
-            logger.debug("Holographic pre-compress skipped: already extracted this turn")
             return ""
 
         # Fire-and-forget: don't block compression waiting for LLM
