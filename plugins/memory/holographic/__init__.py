@@ -12,7 +12,6 @@ Config in $HERMES_HOME/config.yaml (profile-scoped):
       db_path: $HERMES_HOME/memory_store.db   # omit to use the default
       auto_extract: false                       # legacy regex-based extraction
       llm_extract: false                        # LLM-based extraction (overrides auto_extract)
-      extract_frequency: 10                     # extract every N turns (0 = only on end/compress)
       default_trust: 0.5
       min_trust_threshold: 0.3
       temporal_decay_half_life: 0
@@ -286,8 +285,6 @@ class HolographicMemoryProvider(MemoryProvider):
 
         # Extraction state
         self._llm_extract_enabled = self._config.get("llm_extract", False)
-        self._extract_frequency = int(self._config.get("extract_frequency", 10))
-        self._turn_count = 0
         self._last_extracted_idx = 0  # index into conversation messages
         self._extracted_this_turn = False  # guard: has sync_turn already extracted this turn?
 
@@ -322,7 +319,6 @@ class HolographicMemoryProvider(MemoryProvider):
             {"key": "db_path", "description": "SQLite database path", "default": _default_db},
             {"key": "auto_extract", "description": "Auto-extract facts at session end (regex)", "default": "false", "choices": ["true", "false"]},
             {"key": "llm_extract", "description": "LLM-based fact extraction (overrides auto_extract)", "default": "false", "choices": ["true", "false"]},
-            {"key": "extract_frequency", "description": "Extract every N turns (0 = only on session end / compress)", "default": "10"},
             {"key": "default_trust", "description": "Default trust score for new facts", "default": "0.5"},
             {"key": "hrr_dim", "description": "HRR vector dimensions", "default": "1024"},
         ]
@@ -351,7 +347,6 @@ class HolographicMemoryProvider(MemoryProvider):
             hrr_dim=hrr_dim,
         )
         self._session_id = session_id
-        self._turn_count = 0
         self._last_extracted_idx = 0
         self._extracted_this_turn = False
 
@@ -395,31 +390,13 @@ class HolographicMemoryProvider(MemoryProvider):
             return ""
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", messages: list | None = None) -> None:
-        """Count turns and trigger LLM extraction periodically.
+        """Reset the same-turn extraction guard for the new turn.
 
-        Lowest priority: only fires when _extract_frequency is reached.
-        Sets _extracted_this_turn so on_pre_compress can skip if we already handled it.
+        Periodic extraction is not used — extraction only fires on
+        pre-compress and session-end. This reset ensures on_pre_compress
+        doesn't skip a fresh turn thinking it was already handled.
         """
-        # Reset the turn guard
         self._extracted_this_turn = False
-
-        if not self._llm_extract_enabled or not self._store:
-            return
-        if self._extract_frequency <= 0:
-            return
-
-        self._turn_count += 1
-
-        # Check if it's time to extract
-        if self._turn_count % self._extract_frequency != 0:
-            return
-
-        # Extract from new messages
-        if messages and len(messages) > self._last_extracted_idx:
-            new_msgs = messages[self._last_extracted_idx:]
-            self._run_llm_extraction(new_msgs)
-            self._last_extracted_idx = len(messages)
-            self._extracted_this_turn = True
 
     def on_pre_compress(self, messages: list) -> str:
         """Extract facts before context compression discards messages.
