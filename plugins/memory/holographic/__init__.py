@@ -6,20 +6,29 @@ with entity resolution, trust scoring, and HRR-based compositional retrieval.
 Original plugin by dusterbloom (PR #2351), adapted to the MemoryProvider ABC.
 
 Config in $HERMES_HOME/config.yaml (profile-scoped):
+
   plugins:
     hermes-memory-store:
       db_path: $HERMES_HOME/memory_store.db   # omit to use the default
-      auto_extract: false
+      auto_extract: false                       # legacy regex-based extraction
+      llm_extract: false                        # LLM-based extraction (overrides auto_extract)
+      extract_frequency: 10                     # extract every N turns (0 = only on end/compress)
       default_trust: 0.5
       min_trust_threshold: 0.3
       temporal_decay_half_life: 0
+      extraction_model:
+        provider: deepseek                      # provider name (resolves API key from env)
+        model: deepseek-v4-flash                # model for extraction (cheap models work well)
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import urllib.error
+import urllib.request
 from typing import Any, Dict, List
 
 from agent.memory_provider import MemoryProvider
@@ -30,9 +39,52 @@ from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
 
+# Known provider base URLs (can be overridden via {PROVIDER}_BASE_URL env)
+_DEFAULT_BASE_URLS = {
+    "deepseek": "https://api.deepseek.com/v1",
+    "openai": "https://api.openai.com/v1",
+    "anthropic": "https://api.anthropic.com/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "groq": "https://api.groq.com/openai/v1",
+    "gemini": "https://generativelanguage.googleapis.com/v1",
+    "minimax": "https://api.minimax.chat/v1",
+    "ollama": "http://localhost:11434/v1",
+}
 
 # ---------------------------------------------------------------------------
-# Tool schemas (unchanged from original PR)
+# LLM extraction prompt
+# ---------------------------------------------------------------------------
+
+_EXTRACTION_SYSTEM_PROMPT = """You are a memory extraction assistant. Your task is to analyze conversation turns and extract facts worth remembering.
+
+Extract facts about:
+1. User preferences, habits, and personal information
+2. Project decisions, architecture choices, and technical rationale
+3. Tool configurations, setup steps, and environment details
+4. Key conventions and agreements made during the conversation
+5. Any other information that would be useful to remember across sessions
+
+Rules:
+- Only extract concrete, specific facts. Skip small talk and greetings.
+- Prefer concise, self-contained statements.
+- If nothing worth extracting, return an empty array.
+- Deduplicate: don't extract the same fact multiple times.
+
+Return a JSON array of objects, each with:
+- "content": the fact statement (plain text, max 400 chars)
+- "category": one of "user_pref", "project", "tool", "general"
+- "tags": optional comma-separated tags
+
+Example:
+[
+  {"content": "User prefers to use VS Code for Python development", "category": "user_pref", "tags": "editor,python"},
+  {"content": "Project uses FastAPI with SQLAlchemy for backend", "category": "project", "tags": "backend,stack"},
+  {"content": "Hermes gateway runs on port 8080 with 3 platforms connected", "category": "tool", "tags": "hermes,config"}
+]"""
+
+
+# ---------------------------------------------------------------------------
+# Tool schemas
 # ---------------------------------------------------------------------------
 
 FACT_STORE_SCHEMA = {
@@ -109,6 +161,111 @@ def _load_plugin_config() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# LLM extraction helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_provider_credentials(provider: str) -> tuple[str, str]:
+    """Resolve (base_url, api_key) for a given provider name.
+
+    Reads from environment first, falls back to known defaults.
+    Returns (base_url or "", api_key or "").
+    """
+    prefix = provider.upper().replace("-", "_")
+    api_key = os.environ.get(f"{prefix}_API_KEY", "")
+    base_url = os.environ.get(f"{prefix}_BASE_URL", _DEFAULT_BASE_URLS.get(provider, ""))
+    return base_url.rstrip("/"), api_key
+
+
+def _call_extraction_llm(
+    messages_text: str,
+    provider: str,
+    model: str,
+    timeout: int = 30,
+) -> list[dict]:
+    """Call the extraction LLM and return parsed fact objects.
+
+    Returns list of {"content": str, "category": str, "tags": str}.
+    Returns empty list on any error (fail-safe).
+    """
+    base_url, api_key = _resolve_provider_credentials(provider)
+    if not api_key:
+        logger.warning("Holographic LLM extract: no API key found for provider '%s'", provider)
+        return []
+    if not base_url:
+        logger.warning("Holographic LLM extract: no base URL for provider '%s'", provider)
+        return []
+    if not model:
+        logger.warning("Holographic LLM extract: no model specified")
+        return []
+
+    url = f"{base_url}/chat/completions"
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _EXTRACTION_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Extract facts from these conversation turns:\n\n{messages_text}"},
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.1,
+        "max_tokens": 2048,
+    }
+
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            response_data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError) as e:
+        logger.warning("Holographic LLM extract request failed: %s", e)
+        return []
+
+    try:
+        content = response_data["choices"][0]["message"]["content"]
+        parsed = json.loads(content)
+    except (KeyError, IndexError, json.JSONDecodeError) as e:
+        logger.warning("Holographic LLM extract: failed to parse response: %s", e)
+        return []
+
+    if isinstance(parsed, dict):
+        # Some providers wrap in {"facts": [...]}
+        for key in ("facts", "memories", "extractions", "results"):
+            if key in parsed and isinstance(parsed[key], list):
+                parsed = parsed[key]
+                break
+
+    if not isinstance(parsed, list):
+        logger.warning("Holographic LLM extract: unexpected response format: %s", type(parsed).__name__)
+        return []
+
+    # Validate and normalize each fact
+    facts = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        content = str(item.get("content", "")).strip()
+        if len(content) < 10:
+            continue
+        content = content[:400]
+        category = str(item.get("category", "general")).strip()
+        if category not in ("user_pref", "project", "tool", "general"):
+            category = "general"
+        tags = str(item.get("tags", "")).strip()
+        facts.append({"content": content, "category": category, "tags": tags})
+
+    return facts
+
+
+# ---------------------------------------------------------------------------
 # MemoryProvider implementation
 # ---------------------------------------------------------------------------
 
@@ -120,6 +277,17 @@ class HolographicMemoryProvider(MemoryProvider):
         self._store = None
         self._retriever = None
         self._min_trust = float(self._config.get("min_trust_threshold", 0.3))
+
+        # LLM extraction config
+        llm_cfg = self._config.get("extraction_model", {})
+        self._extraction_provider = str(llm_cfg.get("provider", "deepseek"))
+        self._extraction_model = str(llm_cfg.get("model", "deepseek-v4-flash"))
+
+        # Extraction state
+        self._llm_extract_enabled = self._config.get("llm_extract", False)
+        self._extract_frequency = int(self._config.get("extract_frequency", 10))
+        self._turn_count = 0
+        self._last_extracted_idx = 0  # index into conversation messages
 
     @property
     def name(self) -> str:
@@ -150,7 +318,9 @@ class HolographicMemoryProvider(MemoryProvider):
         _default_db = f"{display_hermes_home()}/memory_store.db"
         return [
             {"key": "db_path", "description": "SQLite database path", "default": _default_db},
-            {"key": "auto_extract", "description": "Auto-extract facts at session end", "default": "false", "choices": ["true", "false"]},
+            {"key": "auto_extract", "description": "Auto-extract facts at session end (regex)", "default": "false", "choices": ["true", "false"]},
+            {"key": "llm_extract", "description": "LLM-based fact extraction (overrides auto_extract)", "default": "false", "choices": ["true", "false"]},
+            {"key": "extract_frequency", "description": "Extract every N turns (0 = only on session end / compress)", "default": "10"},
             {"key": "default_trust", "description": "Default trust score for new facts", "default": "0.5"},
             {"key": "hrr_dim", "description": "HRR vector dimensions", "default": "1024"},
         ]
@@ -179,6 +349,8 @@ class HolographicMemoryProvider(MemoryProvider):
             hrr_dim=hrr_dim,
         )
         self._session_id = session_id
+        self._turn_count = 0
+        self._last_extracted_idx = 0
 
     def system_prompt_block(self) -> str:
         if not self._store:
@@ -219,10 +391,34 @@ class HolographicMemoryProvider(MemoryProvider):
             logger.debug("Holographic prefetch failed: %s", e)
             return ""
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        # Holographic memory stores explicit facts via tools, not auto-sync.
-        # The on_session_end hook handles auto-extraction if configured.
-        pass
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", messages: list | None = None) -> None:
+        """Count turns and trigger LLM extraction periodically."""
+        if not self._llm_extract_enabled or not self._store:
+            return
+        if self._extract_frequency <= 0:
+            return
+
+        self._turn_count += 1
+
+        # Check if it's time to extract
+        if self._turn_count % self._extract_frequency != 0:
+            return
+
+        # Extract from new messages
+        if messages and len(messages) > self._last_extracted_idx:
+            new_msgs = messages[self._last_extracted_idx:]
+            self._run_llm_extraction(new_msgs)
+            self._last_extracted_idx = len(messages)
+
+    def on_pre_compress(self, messages: list) -> str:
+        """Extract facts before context compression discards messages."""
+        if not self._llm_extract_enabled or not self._store or not messages:
+            return ""
+        # Run synchronously — we need this before compression
+        facts = self._run_llm_extraction(messages)
+        if facts:
+            logger.info("Holographic pre-compress extracted %d facts", len(facts))
+        return ""  # No text to inject into compression prompt
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [FACT_STORE_SCHEMA, FACT_FEEDBACK_SCHEMA]
@@ -235,11 +431,18 @@ class HolographicMemoryProvider(MemoryProvider):
         return tool_error(f"Unknown tool: {tool_name}")
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        if not self._config.get("auto_extract", False):
-            return
         if not self._store or not messages:
             return
-        self._auto_extract_facts(messages)
+        if self._llm_extract_enabled:
+            # LLM-based extraction for all unprocessed messages
+            new_msgs = messages[self._last_extracted_idx:]
+            if new_msgs:
+                facts = self._run_llm_extraction(new_msgs)
+                if facts:
+                    logger.info("Holographic session-end LLM extracted %d facts", len(facts))
+        elif self._config.get("auto_extract", False):
+            # Legacy regex-based extraction
+            self._auto_extract_facts(messages)
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
         """Mirror built-in memory writes as facts."""
@@ -253,6 +456,62 @@ class HolographicMemoryProvider(MemoryProvider):
     def shutdown(self) -> None:
         self._store = None
         self._retriever = None
+
+    # -- LLM extraction --------------------------------------------------------
+
+    def _run_llm_extraction(self, messages: list) -> list[dict]:
+        """Extract facts from a list of conversation messages via LLM.
+
+        Returns list of stored facts (with fact_id). Empty on error/ nothing to extract.
+        """
+        # Build compact text from messages
+        lines = []
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if not isinstance(content, str) or len(content.strip()) < 10:
+                continue
+            if role in ("user", "assistant"):
+                label = "User" if role == "user" else "Assistant"
+                lines.append(f"{label}: {content[:1000]}")
+
+        if len(lines) < 2:
+            return []
+
+        text = "\n\n".join(lines)
+
+        # Truncate to avoid excessive token usage (roughly 8K chars is safe)
+        if len(text) > 24000:
+            # Keep first and last messages
+            head = text[:12000]
+            tail = text[-10000:]
+            text = head + "\n\n... [truncated] ...\n\n" + tail
+
+        facts = _call_extraction_llm(
+            messages_text=text,
+            provider=self._extraction_provider,
+            model=self._extraction_model,
+        )
+
+        if not facts:
+            return []
+
+        stored = []
+        for fact in facts:
+            try:
+                fact_id = self._store.add_fact(
+                    fact["content"],
+                    category=fact.get("category", "general"),
+                    tags=fact.get("tags", ""),
+                )
+                stored.append({"fact_id": fact_id, **fact})
+            except Exception:
+                # Duplicate (UNIQUE constraint) or other DB error — skip silently
+                pass
+
+        if stored:
+            logger.info("Holographic LLM extracted %d new facts (from %d candidates)", len(stored), len(facts))
+        return stored
 
     # -- Tool handlers -------------------------------------------------------
 
@@ -354,7 +613,7 @@ class HolographicMemoryProvider(MemoryProvider):
         except Exception as exc:
             return tool_error(str(exc))
 
-    # -- Auto-extraction (on_session_end) ------------------------------------
+    # -- Legacy regex extraction (auto_extract mode) --------------------------
 
     def _auto_extract_facts(self, messages: list) -> None:
         _PREF_PATTERNS = [
