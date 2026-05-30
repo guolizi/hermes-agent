@@ -94,9 +94,35 @@ _RE_AKA          = re.compile(
 _RE_CJK_BRACKETS = re.compile(
     r"[「『]([^」』]+)[」』]|《([^》]+)》|\u201c([^\u201d]+)\u201d|\u2018([^\u2019]+)\u2019"
 )
+# Mixed-script identifiers — tokens that look like code identifiers
+# rather than ordinary English words embedded in Chinese text.
+# Matches patterns that structurally differ from plain English:
+#   - Compound identifiers with internal separators (.-_/)
+#   - Version/hybrid patterns (letter+digit, name-version)
+#   - Hash/issue references (#xxx)
 _RE_MIXED_SCRIPT = re.compile(
-    r'[A-Za-z][A-Za-z0-9_.\-]+(?:\s+\d+(?:\.\d+)*)*'
+    r'(?:'
+    r'[A-Za-z][A-Za-z0-9]*[.\-_/][A-Za-z0-9.\-_/]+'   # compound with separator
+    r'|'
+    r'[A-Za-z]+-\d+(?:[.\-]\d+)*'                        # version: GPT-4, Python-3.12
+    r'|'
+    r'[A-Za-z]+\d[A-Za-z0-9]*'                            # letter-digit: P0, PR104
+    r'|'
+    r'#[A-Za-z0-9_-]+'                                    # hash: #892, #issue-ref
+    r')'
 )
+# Stopwords: English loanwords commonly used as ordinary nouns in CJK
+# tech discourse (not identifiers). Post-filter applied to _RE_MIXED_SCRIPT
+# results as a belt-and-suspenders measure.
+_RE_MIXED_STOPWORDS: frozenset[str] = frozenset({
+    'fork', 'bug', 'schema', 'design', 'test', 'tests', 'testing',
+    'code', 'data', 'file', 'files', 'check', 'build', 'status',
+    'release', 'deploy', 'stage', 'review', 'request', 'timeout',
+    'feature', 'update', 'priority', 'channel', 'post', 'team',
+    'config', 'agent', 'server', 'client', 'api', 'key',
+    'log', 'logs', 'error', 'errors', 'service', 'task', 'role',
+    'user', 'name', 'type', 'value', 'list', 'pipeline', 'production',
+})
 
 
 def _clamp_trust(value: float) -> float:
@@ -457,7 +483,9 @@ class MemoryStore:
 
         # Rule 6: Mixed-script identifiers — lark-cli, GPT-5.5, Gemini 3.1 Pro
         for m in _RE_MIXED_SCRIPT.finditer(text):
-            _add(m.group(0))
+            token = m.group(0)
+            if token.lower() not in _RE_MIXED_STOPWORDS:
+                _add(token)
 
         return candidates
 
