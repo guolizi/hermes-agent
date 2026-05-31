@@ -626,14 +626,14 @@ class HolographicMemoryProvider(MemoryProvider):
             re.compile(r'\bmy\s+(?:favorite|preferred|default)\s+\w+\s+is\s+(.+)', re.IGNORECASE),
             re.compile(r'\bI\s+(?:always|never|usually)\s+(.+)', re.IGNORECASE),
             re.compile(r'(?:我|我的|以后|后续).{0,24}(?:喜欢|偏好|更喜欢|习惯|通常|默认|希望|想要|需要|不喜欢|讨厌).+'),
-            re.compile(r'(?:我叫|我的名字是|我是|我主要|我负责|我从事).+'),
+            re.compile(r'(?:我叫|我的名字是|我是(?!说|觉得|想|认为|看看|试试|试一下|问|在|考虑|知道)|我主要|我负责|我从事).+'),
             re.compile(r'(?:请|帮我).{0,24}(?:默认|以后|后续|一直|优先).+'),
             re.compile(r'(?:不要|别|不需要|不想).+'),
         ]
         _PROJECT_PATTERNS = [
             re.compile(r'\bwe\s+(?:decided|agreed|chose)\s+(?:to\s+)?(.+)', re.IGNORECASE),
             re.compile(r'\bthe\s+project\s+(?:uses|needs|requires)\s+(.+)', re.IGNORECASE),
-            re.compile(r'(?:项目|仓库|代码库|系统|服务|框架|Hermes|hermes|agent_assisstant).{0,40}(?:使用|采用|依赖|需要|要求|部署|运行|工作目录|入口|端口|配置|保存|存储).+'),
+            re.compile(r'(?:项目|仓库|代码库|系统|服务|框架|Hermes|hermes|agent_assistant).{0,40}(?:使用|采用|依赖|需要|要求|部署|运行|工作目录|入口|端口|配置|保存|存储).+'),
             re.compile(r'(?:决定|确定|约定|统一|以后|后续).{0,40}(?:使用|采用|保留|删除|不再|迁移|改成|放在|写入).+'),
             re.compile(r'.{0,24}(?:工作目录|部署目录|配置文件|记忆文件|数据库|服务名|端口).{0,24}(?:是|在|为|叫).+'),
         ]
@@ -663,7 +663,7 @@ class HolographicMemoryProvider(MemoryProvider):
     def _candidate_fact_sentences(self, content: str) -> List[str]:
         sentences: List[str] = []
         for line in re.split(r'\n+', content):
-            for match in re.finditer(r'[^。！？!?；;]+[。！？!?；;]?', line):
+            for match in re.finditer(r'[^。！？!?；;.]+[。！？!?；;.]?', line):
                 sentence = re.sub(r'\s+', ' ', match.group(0).strip())
                 if len(sentence) < 5 or self._looks_like_question(sentence):
                     continue
@@ -674,8 +674,11 @@ class HolographicMemoryProvider(MemoryProvider):
         stripped = sentence.strip()
         if stripped.endswith(("?", "？")):
             return True
+        # 吗 is sentence-final in questions — only flag near the end
+        if "吗" in stripped[-4:]:
+            return True
         return any(marker in stripped for marker in (
-            "什么", "为什么", "怎么", "如何", "哪里", "哪儿", "是否", "是不是", "吗",
+            "什么", "为什么", "怎么", "如何", "哪里", "哪儿", "是否", "是不是",
         ))
 
     def _add_extracted_fact(self, content: str, category: str, seen_norms: set[str]) -> bool:
