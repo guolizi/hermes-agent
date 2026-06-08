@@ -128,7 +128,7 @@ def _load_custom() -> dict[str, list[str]]:
     if not os.path.exists(_CUSTOM_PATH):
         return {}
     try:
-        with open(_CUSTOM_PATH) as f:
+        with open(_CUSTOM_PATH, encoding="utf-8") as f:
             return dict(json.load(f))
     except (json.JSONDecodeError, OSError):
         return {}
