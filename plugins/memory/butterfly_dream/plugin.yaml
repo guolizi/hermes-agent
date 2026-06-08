@@ -1,0 +1,5 @@
+name: butterfly_dream
+version: 0.1.0
+description: "Butterfly Dream — 3D memory with HRR-based compositional retrieval, LLM extraction, trust scoring, and multi-media support."
+hooks:
+  - on_session_end
