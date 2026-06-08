@@ -90,75 +90,6 @@ _RE_AKA          = re.compile(
     re.IGNORECASE,
 )
 
-# CJK-aware entity extraction patterns (issue #24416)
-_RE_CJK_BRACKETS = re.compile(
-    r"[「『]([^」』]+)[」』]|《([^》]+)》|\u201c([^\u201d]+)\u201d|\u2018([^\u2019]+)\u2019"
-)
-# Mixed-script identifiers — tokens that look like code identifiers
-# rather than ordinary English words embedded in Chinese text.
-# Matches patterns that structurally differ from plain English:
-#   - Compound identifiers with internal separators (.-_/)
-#   - Version/hybrid patterns (letter+digit, name-version)
-#   - Hash/issue references (#xxx)
-_RE_MIXED_SCRIPT = re.compile(
-    r'(?:'
-    r'[A-Za-z][A-Za-z0-9]*[.\-_/][A-Za-z0-9.\-_/]+'   # compound with separator
-    r'|'
-    r'[A-Za-z]+-\d+(?:[.\-]\d+)*'                        # version: GPT-4, Python-3.12
-    r'|'
-    r'[A-Za-z]+\d[A-Za-z0-9]*'                            # letter-digit: P0, PR104
-    r'|'
-    r'#[A-Za-z0-9_-]+'                                    # hash: #892, #issue-ref
-    r')'
-)
-# Stopwords: English loanwords commonly used as ordinary nouns in CJK
-# tech discourse (not identifiers). Post-filter applied to _RE_MIXED_SCRIPT
-# results as a belt-and-suspenders measure.
-_RE_MIXED_STOPWORDS: frozenset[str] = frozenset({
-    'fork', 'bug', 'schema', 'design', 'test', 'tests', 'testing',
-    'code', 'data', 'file', 'files', 'check', 'build', 'status',
-    'release', 'deploy', 'stage', 'review', 'request', 'timeout',
-    'feature', 'update', 'priority', 'channel', 'post', 'team',
-    'config', 'agent', 'server', 'client', 'api', 'key',
-    'log', 'logs', 'error', 'errors', 'service', 'task', 'role',
-    'user', 'name', 'type', 'value', 'list', 'pipeline', 'production',
-})
-
-
-# NB: _RE_CAPITALIZED (rule 1) intentionally requires multi-word to avoid
-# extracting every standalone capitalized English word. This is correct for
-# pure-English text but misses proper nouns embedded in CJK text.
-# Rule 7 (in _extract_entities) bridges the gap via a CJK-context check.
-
-# CJK character range (CJK Unified Ideographs): used to decide whether to
-# apply standalone-capitalized-word extraction (rule 7).
-_RE_CJK_RANGE = re.compile(r'[\u4e00-\u9fff]')
-
-# Standalone capitalized words in CJK context — 3+ letter proper nouns
-# (brand names like "App", all-caps acronyms like "IHMS", etc.) that
-# rules 1-6 miss. The caller applies this ONLY when `_RE_CJK_RANGE`
-# matches the input text, so pure-English text is unaffected.
-# The 3-char minimum avoids extracting single-letter initals ("A", "B").
-_RE_CJK_CAPITALIZED = re.compile(
-    r'\b('
-    r'[A-Z][a-z]{2,}'       # Initial-cap: App, Coco
-    r'|'
-    r'[A-Z]{3,}'            # ALL-CAPS: IHMS, API
-    r')\b'
-)
-# Stopwords for rule 7 — common English words that happen to be
-# capitalized (e.g. at sentence start, or standalone in CJK text).
-_RE_CJK_CAPITALIZED_STOPWORDS: frozenset[str] = frozenset({
-    'the', 'this', 'that', 'with', 'from', 'have', 'has', 'had',
-    'not', 'but', 'for', 'are', 'was', 'were', 'been', 'will',
-    'can', 'may', 'must', 'get', 'got', 'use', 'used', 'using',
-    'set', 'run', 'see', 'now', 'new', 'all', 'any', 'each',
-    'one', 'two', 'also', 'very', 'just', 'than', 'then',
-    'how', 'why', 'what', 'when', 'who', 'which', 'where',
-    'does', 'doing', 'done', 'made', 'make', 'like', 'said',
-})
-
-
 
 def _clamp_trust(value: float) -> float:
     return max(_TRUST_MIN, min(_TRUST_MAX, value))
@@ -465,36 +396,24 @@ class MemoryStore:
     # ------------------------------------------------------------------
 
     def _extract_entities(self, text: str) -> list[str]:
-        """Extract entity candidates from text using regex rules.
+        """Extract entity candidates from text using simple regex rules.
 
         Rules applied (in order):
         1. Capitalized multi-word phrases  e.g. "John Doe"
         2. Double-quoted terms             e.g. "Python"
         3. Single-quoted terms             e.g. 'pytest'
         4. AKA patterns                    e.g. "Guido aka BDFL" -> two entities
-        5. CJK bracket/quote terms         e.g. 「白兔」 《红楼梦》
-        6. Mixed-script identifiers        e.g. lark-cli, GPT-5.5, Gemini 3.1 Pro
-        7. CJK-context capitalized words   e.g. "App" in CJK text, "IHMS", "Coco"
-        7. CJK runs (2-6 chars, filtered)  e.g. 飞书 (after stopword removal)
-            — intentionally omitted; bare CJK regex without a dictionary
-              segmenter produces too many cross-word fragments (see issue #24416
-              discussion).  Rules 5-6 cover the high-signal cases.
 
-        English behavior is fully unchanged — rules 1-4 are identical to
-        the original implementation.  Rules 5-6 only fire for non-ASCII
-        content.  Returns a deduplicated list preserving first-seen order.
+        Returns a deduplicated list preserving first-seen order.
         """
         seen: set[str] = set()
         candidates: list[str] = []
 
         def _add(name: str) -> None:
             stripped = name.strip()
-            if not stripped or stripped.lower() in seen:
-                return
-            seen.add(stripped.lower())
-            candidates.append(stripped)
-
-        # --- Rules 1-4: original ASCII rules (unchanged) ---
+            if stripped and stripped.lower() not in seen:
+                seen.add(stripped.lower())
+                candidates.append(stripped)
 
         for m in _RE_CAPITALIZED.finditer(text):
             _add(m.group(1))
@@ -508,30 +427,6 @@ class MemoryStore:
         for m in _RE_AKA.finditer(text):
             _add(m.group(1))
             _add(m.group(2))
-
-        # --- Rules 5-7: CJK-aware rules ---
-
-        # Rule 5: CJK brackets and quotes — 「…」 『…』 《…》 "" ''
-        for m in _RE_CJK_BRACKETS.finditer(text):
-            for g in m.groups():
-                if g:
-                    _add(g)
-
-        # Rule 6: Mixed-script identifiers — lark-cli, GPT-5.5, Gemini 3.1 Pro
-        for m in _RE_MIXED_SCRIPT.finditer(text):
-            token = m.group(0)
-            if token.lower() not in _RE_MIXED_STOPWORDS:
-                _add(token)
-
-        # Rule 7: Standalone capitalized words in CJK context
-        # e.g. "App" in "飞书白兔 App 已于接入" / "IHMS" in "IHMS 系统已部署"
-        # Only fires when CJK characters are present in the text, so
-        # pure-English text is unaffected (rule 1 already handles multi-word).
-        if _RE_CJK_RANGE.search(text):
-            for m in _RE_CJK_CAPITALIZED.finditer(text):
-                token = m.group(1)
-                if token.lower() not in _RE_CJK_CAPITALIZED_STOPWORDS:
-                    _add(token)
 
         return candidates
 
