@@ -885,11 +885,13 @@ class ThreeDimRetriever:
         """Remove FTS5 special characters, lemmatize English, filter stop words, and collapse whitespace."""
         import re
         # Remove characters that could break FTS5 syntax
-        # Keep # (common in C#/F#) — it's safe in FTS5
+        # NOTE: # is NOT safe — FTS5 uses # as near/column operator, and
+        # jieba already splits e.g. \"#31007\" into separate tokens. The #
+        # just gets stripped; 31007 still matches via prefix.
         # NOTE: + is intentionally excluded — FTS5 unicode61 tokenizer strips + during indexing,
         # so querying with + (e.g. "LGBTQ+", "C++") would never match. Without + in the
         # query, "LGBTQ+ events" matches the same index tokens as "LGBTQ events".
-        safe = re.sub(r'[^\w\s\u4e00-\u9fff\u3000-\u303f\uff00-\uffef#]', ' ', query)
+        safe = re.sub(r'[^\w\s\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]', ' ', query)
         # Jieba-segment CJK text to match FTS5 indexing
         tokens = []
         for word in safe.split():
