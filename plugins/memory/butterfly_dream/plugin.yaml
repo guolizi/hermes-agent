@@ -3,3 +3,8 @@ version: 0.1.0
 description: "Butterfly Dream — 3D memory with HRR-based compositional retrieval, LLM extraction, trust scoring, and multi-media support."
 hooks:
   - on_session_end
+  - on_session_switch
+  - on_pre_compress
+  - on_memory_write
+  - sync_turn
+  - shutdown
