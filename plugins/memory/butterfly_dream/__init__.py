@@ -489,6 +489,7 @@ def _call_extraction_llm(
     model: str,
     timeout: int = 90,
     system_prompt: str | None = None,
+    dlog: logging.Logger | None = None,  # dedicated butterfly logger (butterfly.log)
 ) -> list[dict]:
     """Call the extraction LLM and return parsed fact objects with importance.
 
@@ -499,17 +500,18 @@ def _call_extraction_llm(
         system_prompt: Optional override for the system prompt.
                        Defaults to _EXTRACTION_SYSTEM_PROMPT.
     """
+    log = dlog or logger  # prefer butterfly.log, fallback to Hermes root
     import time as _time
 
     base_url, api_key = _resolve_provider_credentials(provider)
     if not api_key:
-        logger.warning("ButterflyDream LLM extract: no API key for '%s'", provider)
+        log.warning("ButterflyDream LLM extract: no API key for '%s'", provider)
         return []
     if not base_url:
-        logger.warning("ButterflyDream LLM extract: no base URL for '%s'", provider)
+        log.warning("ButterflyDream LLM extract: no base URL for '%s'", provider)
         return []
     if not model:
-        logger.warning("ButterflyDream LLM extract: no model specified")
+        log.warning("ButterflyDream LLM extract: no model specified")
         return []
 
     # Detect conversation language and reinforce output language
@@ -555,10 +557,10 @@ def _call_extraction_llm(
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 response_data = json.loads(resp.read().decode("utf-8"))
         except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError) as e:
-            logger.warning("ButterflyDream LLM extract request failed (attempt %d/%d): %s", attempt + 1, max_retries, e)
+            log.warning("ButterflyDream LLM extract request failed (attempt %d/%d): %s", attempt + 1, max_retries, e)
             if attempt < max_retries - 1:
                 delay = backoff_delays[attempt]
-                logger.info("ButterflyDream LLM extract: retrying in %ds...", delay)
+                log.info("ButterflyDream LLM extract: retrying in %ds...", delay)
                 _time.sleep(delay)
                 continue
             return []
@@ -578,10 +580,10 @@ def _call_extraction_llm(
             # Success - break out of retry loop
             break
         except (KeyError, IndexError, json.JSONDecodeError, ValueError) as e:
-            logger.warning("ButterflyDream LLM extract: parse failed (attempt %d/%d): %s", attempt + 1, max_retries, e)
+            log.warning("ButterflyDream LLM extract: parse failed (attempt %d/%d): %s", attempt + 1, max_retries, e)
             if attempt < max_retries - 1:
                 delay = backoff_delays[attempt]
-                logger.info("ButterflyDream LLM extract: retrying in %ds...", delay)
+                log.info("ButterflyDream LLM extract: retrying in %ds...", delay)
                 _time.sleep(delay)
                 continue
             return []
@@ -614,9 +616,9 @@ def _call_extraction_llm(
     if isinstance(parsed, list):
         pass  # good
     elif isinstance(parsed, dict):
-        logger.debug("LLM extract dict keys: %s", list(parsed.keys())[:5])
-        logger.debug("LLM extract dict sample: %s", str(parsed)[:200])
-        logger.warning("ButterflyDream LLM extract: unexpected format: %s", type(parsed).__name__)
+        log.debug("LLM extract dict keys: %s", list(parsed.keys())[:5])
+        log.debug("LLM extract dict sample: %s", str(parsed)[:200])
+        log.warning("ButterflyDream LLM extract: unexpected format: %s", type(parsed).__name__)
         return []
 
     # Validate and normalize
@@ -892,7 +894,7 @@ class ButterflyDreamMemoryProvider(MemoryProvider):
                 )
             return "## 🦋 Butterfly Dream Memory\n" + "\n".join(lines)
         except Exception as e:
-            logger.debug("ButterflyDream prefetch failed: %s", e)
+            self._dlog.debug("prefetch failed: %s", e)
             return ""
 
     def _start_extract_thread(self, target, name):
@@ -939,8 +941,10 @@ class ButterflyDreamMemoryProvider(MemoryProvider):
                 if facts:
                     logger.info("ButterflyDream sync_turn extracted %d facts (interval=%d)",
                                 len(facts), self._extract_interval)
+                    self._dlog.info("sync_turn: extracted %d facts (interval=%d)",
+                                    len(facts), self._extract_interval)
             except Exception as e:
-                logger.debug("ButterflyDream sync_turn extraction failed: %s", e)
+                self._dlog.debug("sync_turn extraction failed: %s", e)
 
         self._start_extract_thread(_extract_async, "butterfly-sync")
 
@@ -964,8 +968,9 @@ class ButterflyDreamMemoryProvider(MemoryProvider):
                 facts = self._run_llm_extraction(msgs_copy)
                 if facts:
                     logger.info("ButterflyDream pre-compress extracted %d facts", len(facts))
+                    self._dlog.info("pre-compress: extracted %d facts", len(facts))
             except Exception as e:
-                logger.debug("ButterflyDream pre-compress extraction failed: %s", e)
+                self._dlog.debug("pre-compress extraction failed: %s", e)
 
         self._start_extract_thread(_extract_async, "butterfly-compress")
         return ""
@@ -1008,6 +1013,7 @@ class ButterflyDreamMemoryProvider(MemoryProvider):
                         facts = self._run_llm_extraction(msgs_copy)
                         if facts:
                             logger.info("ButterflyDream session-end extracted %d facts", len(facts))
+                            self._dlog.info("session-end: extracted %d facts", len(facts))
                         # Reflection: check after extraction for accurate count
                         if self._reflection_enabled:
                             with self._extraction_lock:
@@ -1016,9 +1022,9 @@ class ButterflyDreamMemoryProvider(MemoryProvider):
                                 try:
                                     self._run_reflection()
                                 except Exception as e:
-                                    logger.debug("ButterflyDream reflection failed: %s", e)
+                                    self._dlog.debug("reflection failed: %s", e)
                     except Exception as e:
-                        logger.debug("ButterflyDream session-end extraction failed: %s", e)
+                        self._dlog.debug("session-end extraction failed: %s", e)
 
                 self._start_extract_thread(_extract_async, "butterfly-close")
 
@@ -1042,6 +1048,7 @@ class ButterflyDreamMemoryProvider(MemoryProvider):
                 self._turn_counter = 0
                 self._last_extracted_idx = 0
             logger.debug("ButterflyDream session_switch(reset=True): counters reset")
+            self._dlog.debug("session_switch: counters reset")
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
         """Mirror built-in memory writes as facts with default importance."""
@@ -1056,6 +1063,7 @@ class ButterflyDreamMemoryProvider(MemoryProvider):
                                      is_persistent=is_persistent, dedup_threshold=0.7)
             except Exception as e:
                 logger.debug("ButterflyDream memory_write mirror failed: %s", e)
+                self._dlog.debug("memory_write mirror failed: %s", e)
 
     def shutdown(self) -> None:
         # Wait for async extraction threads to finish (they may be writing to the store)
@@ -1079,7 +1087,7 @@ class ButterflyDreamMemoryProvider(MemoryProvider):
         """
         # Circuit breaker: skip if in cooldown
         if not self._circuit_breaker_ok():
-            logger.debug("ButterflyDream: extraction skipped (circuit breaker cooldown)")
+            self._dlog.debug("ButterflyDream: extraction skipped (circuit breaker cooldown)")
             return []
 
         lines = []
@@ -1116,17 +1124,18 @@ class ButterflyDreamMemoryProvider(MemoryProvider):
             messages_text=text,
             provider=self._extraction_provider,
             model=self._extraction_model,
+            dlog=self._dlog,
         )
 
         # Debug: log raw LLM output
         if facts:
-            logger.debug("ButterflyDream: LLM extracted %d raw facts", len(facts))
+            self._dlog.debug("ButterflyDream: LLM extracted %d raw facts", len(facts))
             for i, f in enumerate(facts):
-                logger.debug("  raw[%d] content='%.80s' cat=%s imp=%s date=%s",
+                self._dlog.debug("  raw[%d] content='%.80s' cat=%s imp=%s date=%s",
                              i, f.get("content", ""), f.get("category", ""),
                              f.get("importance", "?"), f.get("content_date", "?"))
         else:
-            logger.debug("ButterflyDream: LLM returned 0 facts")
+            self._dlog.debug("ButterflyDream: LLM returned 0 facts")
 
         # Circuit breaker: track result
         success = bool(facts)
@@ -1152,10 +1161,10 @@ class ButterflyDreamMemoryProvider(MemoryProvider):
                 # Debug: log storage result
                 is_new = "inserted" if result.get("fact_id") and not result.get("merged") else \
                          "merged" if result.get("merge_type") else "existing"
-                logger.debug("  stored[%d] fact_id=%d %s: '%.80s'",
+                self._dlog.debug("  stored[%d] fact_id=%d %s: '%.80s'",
                              len(stored) - 1, result.get("fact_id", -1), is_new, result.get("content", ""))
             except Exception as e:
-                logger.debug("ButterflyDream store fact failed for '%.60s': %s", fact.get("content", ""), e)
+                self._dlog.debug("ButterflyDream store fact failed for '%.60s': %s", fact.get("content", ""), e)
 
         # Track extraction count for reflection trigger
         if stored:
@@ -1189,6 +1198,7 @@ class ButterflyDreamMemoryProvider(MemoryProvider):
                 self._extraction_failures = 0
                 self._cooldown_until = 0.0
                 logger.info("ButterflyDream circuit breaker: cooldown expired, resetting")
+                self._dlog.info("circuit breaker: cooldown expired, resetting")
                 return True
             return False
 
@@ -1208,6 +1218,10 @@ class ButterflyDreamMemoryProvider(MemoryProvider):
                         "cooling down for %ds",
                         self._extraction_failures, self._cb_cooldown,
                     )
+                    self._dlog.warning(
+                        "circuit breaker: %d consecutive failures, cooling down for %ds",
+                        self._extraction_failures, self._cb_cooldown,
+                    )
 
     def _run_reflection(self) -> None:
         """LLM meta-analysis of stored facts → generate pattern insights.
@@ -1221,6 +1235,7 @@ class ButterflyDreamMemoryProvider(MemoryProvider):
         # Respect circuit breaker: don't call LLM during cooldown
         if not self._circuit_breaker_ok():
             logger.debug("ButterflyDream reflection: skipped (circuit breaker cooldown)")
+            self._dlog.debug("reflection: skipped (circuit breaker cooldown)")
             return
         try:
             all_facts = self._store.list_facts(limit=100)
@@ -1248,6 +1263,7 @@ class ButterflyDreamMemoryProvider(MemoryProvider):
             provider=self._extraction_provider,
             model=self._extraction_model,
             system_prompt=_REFLECTION_SYSTEM_PROMPT,
+            dlog=self._dlog,
         )
 
         # Track result in circuit breaker (shared with extraction)
@@ -1255,7 +1271,7 @@ class ButterflyDreamMemoryProvider(MemoryProvider):
         self._mark_extraction_result(success)
 
         if not meta_facts:
-            logger.debug("ButterflyDream reflection: no insights generated")
+            self._dlog.debug("reflection: no insights generated")
             return
 
         stored = 0
@@ -1276,10 +1292,11 @@ class ButterflyDreamMemoryProvider(MemoryProvider):
                 )
                 stored += 1
             except Exception as e:
-                logger.debug("ButterflyDream reflection store failed: %s", e)
+                self._dlog.debug("reflection store failed: %s", e)
 
         if stored:
             logger.info("ButterflyDream reflection: stored %d meta-facts", stored)
+            self._dlog.info("reflection: stored %d meta-facts", stored)
 
     # -- Tool handlers ---------------------------------------------------------
 
@@ -1312,8 +1329,9 @@ class ButterflyDreamMemoryProvider(MemoryProvider):
                 return json.dumps({"error": f"Unknown action: {action}"})
         except Exception as e:
             logger.error("ButterflyDream fact_store error: %s", e, exc_info=True)
+            self._dlog.error("fact_store error: %s", e, exc_info=True)
             return json.dumps({"error": str(e)})
-
+    
     def _handle_add(self, args: dict) -> str:
         content = args.get("content", "").strip()
         if not content:
