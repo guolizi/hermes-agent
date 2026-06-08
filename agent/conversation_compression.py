@@ -308,11 +308,14 @@ def compress_context(
     # The check itself sets ``agent._compression_warning`` so the
     # status-callback replay machinery still emits the warning to the user
     # the first time it would matter.
-    if not getattr(agent, "_compression_feasibility_checked", True):
-        try:
-            check_compression_model_feasibility(agent)
-        finally:
-            agent._compression_feasibility_checked = True
+    if not getattr(agent, "_compression_feasibility_checked", False):
+        # Mark as checked only after the probe completes. If the check
+        # raises (e.g. a fatal aux-context ValueError that aborts the
+        # session), leaving the flag unset is harmless; a non-fatal
+        # transient failure is swallowed inside the function so the flag
+        # is set normally on the next successful pass.
+        check_compression_model_feasibility(agent)
+        agent._compression_feasibility_checked = True
 
     _pre_msg_count = len(messages)
     logger.info(
@@ -350,10 +353,48 @@ def compress_context(
     _lock_db = getattr(agent, "_session_db", None)
     _lock_sid = agent.session_id or ""
     _lock_holder: Optional[str] = None
+    # Probe whether the lock subsystem is actually available on this
+    # SessionDB instance.  A process running mismatched module versions
+    # (e.g. ``conversation_compression.py`` reloaded after a pull but the
+    # long-lived ``hermes_state.SessionDB`` class still bound to the
+    # pre-#34351 version in memory) has the call site but not the method.
+    # In that case ``try_acquire_compression_lock`` raises AttributeError —
+    # NOT a ``sqlite3.Error`` — so the method's own fail-open guard never
+    # runs and the exception propagates to the outer agent loop, which
+    # prints the error and retries.  Because compression never succeeds,
+    # the token count never drops and the loop re-triggers compaction
+    # forever (the "API call #47/#48/#49 ... has no attribute
+    # try_acquire_compression_lock" spin).  Fail OPEN here: if the lock
+    # subsystem is missing or broken in any unexpected way, skip locking
+    # and proceed with compression.  Skipping the lock risks a rare
+    # concurrent-compression session fork; an infinite no-progress loop
+    # that never compresses at all is strictly worse.
     if _lock_db is not None and _lock_sid:
         _lock_holder = _compression_lock_holder(agent)
-        if not _lock_db.try_acquire_compression_lock(_lock_sid, _lock_holder):
-            existing = _lock_db.get_compression_lock_holder(_lock_sid)
+        try:
+            _lock_acquired = _lock_db.try_acquire_compression_lock(
+                _lock_sid, _lock_holder
+            )
+        except Exception as _lock_err:
+            # Broken/absent lock subsystem (version skew, etc.).  Log once
+            # per session and proceed WITHOUT the lock rather than letting
+            # the exception spin the outer loop.
+            _lock_holder = None  # we don't own anything to release
+            if getattr(agent, "_last_compression_lock_error_sid", None) != _lock_sid:
+                agent._last_compression_lock_error_sid = _lock_sid
+                logger.warning(
+                    "compression lock subsystem unavailable for session=%s "
+                    "(%s: %s) — proceeding without lock. This usually means a "
+                    "stale in-memory module after an update; restart the "
+                    "process (or `hermes update`) to resync.",
+                    _lock_sid, type(_lock_err).__name__, _lock_err,
+                )
+            _lock_acquired = True  # treat as acquired-but-unlocked; proceed
+        if not _lock_acquired:
+            try:
+                existing = _lock_db.get_compression_lock_holder(_lock_sid)
+            except Exception:
+                existing = None
             logger.warning(
                 "compression skipped: another path is compressing session=%s "
                 "(holder=%s) — returning messages unchanged to avoid session fork",
@@ -537,19 +578,18 @@ def compress_context(
             force=True,
         )
 
-    # Update token estimate after compaction so pressure calculations
-    # use the post-compression count, not the stale pre-compression one.
-    # Use estimate_request_tokens_rough() so tool schemas are included —
-    # with 50+ tools enabled, schemas alone can add 20-30K tokens, and
-    # omitting them delays the next compression cycle far past the
-    # configured threshold (issue #14695).
+    # Keep the post-compression rough estimate for diagnostics, but do not
+    # treat it as provider-reported prompt usage. Schema-heavy rough estimates
+    # can remain above threshold even after the next real API request fits.
     _compressed_est = estimate_request_tokens_rough(
         compressed,
         system_prompt=new_system_prompt or "",
         tools=agent.tools or None,
     )
-    agent.context_compressor.last_prompt_tokens = _compressed_est
+    agent.context_compressor.last_compression_rough_tokens = _compressed_est
+    agent.context_compressor.last_prompt_tokens = -1
     agent.context_compressor.last_completion_tokens = 0
+    agent.context_compressor.awaiting_real_usage_after_compression = True
 
     # Clear the file-read dedup cache.  After compression the original
     # read content is summarised away — if the model re-reads the same
@@ -561,7 +601,7 @@ def compress_context(
         pass
 
     logger.info(
-        "context compression done: session=%s messages=%d->%d tokens=~%s",
+        "context compression done: session=%s messages=%d->%d rough_tokens=~%s awaiting_real_usage=true",
         agent.session_id or "none", _pre_msg_count, len(compressed),
         f"{_compressed_est:,}",
     )
@@ -606,15 +646,47 @@ def try_shrink_image_parts_in_messages(api_messages: list) -> bool:
     # much larger; shrinking to 4 MB here loses quality but only fires
     # after a confirmed provider rejection, so the alternative is failure.
     target_bytes = 4 * 1024 * 1024
+    # Anthropic enforces an 8000px per-side dimension cap independently of
+    # the 5 MB byte cap.  A tall screenshot can be well under 5 MB yet far
+    # over 8000px (e.g. 1200×12000 at 0.06 MB).  We check pixel dimensions
+    # even when the byte budget is fine.
+    max_dimension = 8000
     changed_count = 0
+    # Track parts that are over the target but could NOT be shrunk under it.
+    # If any survive, retrying is pointless — the same oversized payload will
+    # be re-sent and rejected again, wasting the single retry budget.  We only
+    # report success (caller retries) when every over-threshold image was
+    # actually brought under the target.
+    unshrinkable_oversized = 0
 
     def _shrink_data_url(url: str) -> Optional[str]:
         """Return a smaller data URL, or None if shrink can't help."""
         if not isinstance(url, str) or not url.startswith("data:"):
             return None
-        if len(url) <= target_bytes:
-            # This specific image wasn't the oversized one.
-            return None
+
+        # Check both byte size AND pixel dimensions.
+        needs_shrink = len(url) > target_bytes  # over byte budget
+        if not needs_shrink:
+            # Even if bytes are fine, check pixel dimensions against
+            # Anthropic's 8000px cap.  A tall image can be tiny in bytes
+            # yet huge in pixels.
+            try:
+                import base64 as _b64_dim
+                header_d, _, data_d = url.partition(",")
+                if not data_d:
+                    return None
+                raw_d = _b64_dim.b64decode(data_d)
+                from PIL import Image as _PILImage
+                import io as _io_dim
+                with _PILImage.open(_io_dim.BytesIO(raw_d)) as _img:
+                    if max(_img.size) <= max_dimension:
+                        return None  # both bytes and pixels are fine
+                needs_shrink = True  # pixels exceed limit, force shrink
+            except Exception:
+                # If we can't check dimensions (Pillow unavailable, corrupt
+                # image, etc.), fall back to byte-only check.
+                return None
+
         try:
             header, _, data = url.partition(",")
             mime = "image/jpeg"
@@ -638,6 +710,7 @@ def try_shrink_image_parts_in_messages(api_messages: list) -> bool:
                     Path(tmp.name),
                     mime_type=mime,
                     max_base64_bytes=target_bytes,
+                    max_dimension=max_dimension,
                 )
             finally:
                 try:
@@ -673,17 +746,34 @@ def try_shrink_image_parts_in_messages(api_messages: list) -> bool:
                 if resized:
                     image_value["url"] = resized
                     changed_count += 1
+                elif isinstance(url, str) and url.startswith("data:") \
+                        and len(url) > target_bytes:
+                    unshrinkable_oversized += 1
             elif isinstance(image_value, str):
                 resized = _shrink_data_url(image_value)
                 if resized:
                     part["image_url"] = resized
                     changed_count += 1
+                elif image_value.startswith("data:") \
+                        and len(image_value) > target_bytes:
+                    unshrinkable_oversized += 1
 
     if changed_count:
         logger.info(
             "image-shrink recovery: re-encoded %d image part(s) to fit under %.0f MB",
             changed_count, target_bytes / (1024 * 1024),
         )
+    if unshrinkable_oversized:
+        # At least one oversized image could not be shrunk under the target.
+        # Retrying would re-send it and fail identically, so signal "no
+        # progress" even if other parts shrank — the caller will surface the
+        # original error rather than burning its single retry on a no-op.
+        logger.warning(
+            "image-shrink recovery: %d oversized image part(s) could not be "
+            "shrunk under %.0f MB — not retrying (would re-send rejected payload)",
+            unshrinkable_oversized, target_bytes / (1024 * 1024),
+        )
+        return False
     return changed_count > 0
 
 
