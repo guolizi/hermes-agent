@@ -2407,10 +2407,14 @@ class TestConcurrentToolExecution:
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
         messages = []
 
+        import threading
+        _lock = threading.Lock()
         call_count = [0]
         def fake_handle(name, args, task_id, **kwargs):
-            call_count[0] += 1
-            if call_count[0] == 1:
+            with _lock:
+                call_count[0] += 1
+                is_first = call_count[0] == 1
+            if is_first:
                 raise RuntimeError("boom")
             return "success"
 
