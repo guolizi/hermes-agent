@@ -1,0 +1,15 @@
+name: butterfly-dream
+version: 0.1.0
+description: "3-Dimensional memory — Relevance × Recency × Importance. Local SQLite fact store with LLM extraction, entity tracking, temporal decay, and media attachment support."
+author: guolizi
+homepage: https://github.com/guolizi/butterfly-dream
+pip_dependencies:
+  - jieba
+  - nltk
+  - "numpy>=1.26"
+hooks:
+  - on_session_end
+  - on_session_switch
+  - on_pre_compress
+  - on_memory_write
+  - shutdown
