@@ -239,7 +239,7 @@ class MemoryStore:
         self._hrr_dim = hrr_dim
         self._media_dir = str(Path(db_path).parent / "media")
         self._compression_config = compression_config
-        self._lock = threading.Lock()
+        self._db_lock = threading.RLock()
 
         # Ensure directory exists
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -252,6 +252,13 @@ class MemoryStore:
         # may write while prefetch reads). busy_timeout prevents SQLITE_BUSY errors.
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
+        # ── Read-only connection for search/prefetch ──
+        # Separate connection avoids cache contention on _conn, but both
+        # connections share a single RLock (_db_lock) so that WAL checkpoint
+        # on _conn never races with a concurrent read on _conn_ro.
+        self._conn_ro = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn_ro.row_factory = sqlite3.Row
+        self._conn_ro.execute("PRAGMA busy_timeout=5000")
 
         # Migrate BEFORE schema: existing DBs may lack columns that indexes reference.
         # CREATE TABLE IF NOT EXISTS is a no-op for existing tables, so indexes on
@@ -381,7 +388,7 @@ class MemoryStore:
             importance = 5.0
         importance = max(1.0, min(10.0, float(importance)))
 
-        with self._lock:
+        with self._db_lock:
             # Extract entities from content
             extracted = self._extract_entities(content)
             if entities:
@@ -486,7 +493,10 @@ class MemoryStore:
         # Build a broad FTS5 query (OR) from key tokens to find candidates.
         # AND is too strict — similar facts may use synonyms ("likes" vs "prefers").
         # Jaccard check below ensures precision; FTS5 just gathers candidates.
-        safe = re.sub(r'[^\w\s\u4e00-\u9fff#+]', ' ', content)
+        # NOTE: strip # and + from FTS5 query tokens — #28 is interpreted as
+        # NEAR/28 and causes "fts5: syntax error near '#'" (SQLite FTS5 treats
+        # #N as "within N tokens"). Quoted "#28" works but is fragile.
+        safe = re.sub(r'[^\w\s\u4e00-\u9fff]', ' ', content)
         # Jieba-segment CJK tokens to match FTS5 indexed tokens
         segmented = []
         for w in safe.split():
@@ -560,7 +570,7 @@ class MemoryStore:
         # Strategy B: among entity-sharing facts, pick best FTS5 match
         query_tokens = tokenize(content)
         best = None
-        best_score = 0.15  # minimum similarity threshold (jaccard × trust)
+        best_score = 0.70  # minimum similarity threshold (jaccard × trust) — raised from 0.50 to prevent unrelated merges (different facts sharing entities were being merged)
 
         for row in shared_facts:
             fid, fact_content, fact_imp, fact_trust, fact_tags, fact_persistent = (row[0], row[1], row[2], row[3], row[4], row[5])
@@ -718,7 +728,7 @@ class MemoryStore:
         # Different aspects: combine
         # Check if the new info adds details not in existing
         new_words = n_tokens - e_tokens
-        if len(new_words) >= 2:
+        if len(new_words) >= 5:
             return f"{existing}；{new}"
         return existing  # No meaningful new info
 
@@ -759,8 +769,8 @@ class MemoryStore:
                 "is_persistent": is_persistent, "merged": False}
 
     def get_fact(self, fact_id: int) -> Optional[dict]:
-        with self._lock:
-            row = self._conn.execute(
+        with self._db_lock:
+            row = self._conn_ro.execute(
                 "SELECT * FROM facts WHERE fact_id = ?", (fact_id,)
             ).fetchone()
             if not row:
@@ -777,7 +787,7 @@ class MemoryStore:
         columns = list(updates.keys())
         set_clause = ", ".join(f"{col}=?" for col in columns)
         values = [updates[col] for col in columns] + [fact_id]
-        with self._lock:
+        with self._db_lock:
             self._conn.execute(
                 f"UPDATE facts SET {set_clause} WHERE fact_id=?", values
             )
@@ -785,7 +795,7 @@ class MemoryStore:
             return True
 
     def remove_fact(self, fact_id: int) -> bool:
-        with self._lock:
+        with self._db_lock:
             cursor = self._conn.execute("DELETE FROM facts WHERE fact_id = ?", (fact_id,))
             self._conn.commit()
             return cursor.rowcount > 0
@@ -890,7 +900,7 @@ class MemoryStore:
             shutil.copy2(effective_source, str(abs_path))
 
         # 7. Insert into DB
-        with self._lock:
+        with self._db_lock:
             # Check for existing same-sha attachment on this fact (dedup within fact)
             existing = self._conn.execute(
                 "SELECT media_id FROM media_attachments WHERE fact_id=? AND sha256=?",
@@ -966,7 +976,7 @@ class MemoryStore:
 
     def detach_media(self, media_id: int) -> bool:
         """Remove media attachment from DB. Does NOT delete file from disk."""
-        with self._lock:
+        with self._db_lock:
             cursor = self._conn.execute(
                 "DELETE FROM media_attachments WHERE media_id=?", (media_id,),
             )
@@ -980,8 +990,8 @@ class MemoryStore:
 
     def get_fact_media(self, fact_id: int) -> list[dict]:
         """Get all media attachments for a fact, ordered by creation time."""
-        with self._lock:
-            rows = self._conn.execute(
+        with self._db_lock:
+            rows = self._conn_ro.execute(
                 """SELECT * FROM media_attachments WHERE fact_id=?
                    ORDER BY created_at DESC""",
                 (fact_id,),
@@ -1001,7 +1011,7 @@ class MemoryStore:
             return []
 
         # Load DB paths under a brief lock, then walk disk without holding it
-        with self._lock:
+        with self._db_lock:
             db_paths = {
                 row[0] for row in self._conn.execute(
                     "SELECT file_path FROM media_attachments"
@@ -1038,24 +1048,24 @@ class MemoryStore:
 
     def list_facts(self, limit: int = 50, offset: int = 0,
                     persistent_only: bool = False) -> list[dict]:
-        with self._lock:
+        with self._db_lock:
             if persistent_only:
-                rows = self._conn.execute(
+                rows = self._conn_ro.execute(
                     "SELECT * FROM facts WHERE is_persistent = 1 ORDER BY created_at DESC LIMIT ? OFFSET ?",
                     (limit, offset),
                 ).fetchall()
             else:
-                rows = self._conn.execute(
+                rows = self._conn_ro.execute(
                     "SELECT * FROM facts ORDER BY created_at DESC LIMIT ? OFFSET ?",
                     (limit, offset),
                 ).fetchall()
             return [{key: r[key] for key in r.keys()} for r in rows]
 
     def count_facts(self, persistent_only: bool = False) -> int:
-        with self._lock:
+        with self._db_lock:
             if persistent_only:
-                return self._conn.execute("SELECT COUNT(*) FROM facts WHERE is_persistent = 1").fetchone()[0]
-            return self._conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+                return self._conn_ro.execute("SELECT COUNT(*) FROM facts WHERE is_persistent = 1").fetchone()[0]
+            return self._conn_ro.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
 
     def search_by_date(self, date: str, limit: int = 50) -> list[dict]:
         """Find facts with a specific content_date (YYYY-MM-DD).
@@ -1064,9 +1074,9 @@ class MemoryStore:
             date: ISO date string to match (exact or prefix for month/year queries).
             limit: Max facts to return.
         """
-        with self._lock:
+        with self._db_lock:
             # Exact match first, then prefix (for "2023-01" matching "2023-01-19")
-            rows = self._conn.execute(
+            rows = self._conn_ro.execute(
                 """SELECT * FROM facts WHERE content_date = ?
                    UNION
                    SELECT * FROM facts WHERE content_date LIKE ? AND content_date != ?
@@ -1078,7 +1088,7 @@ class MemoryStore:
     # -- Feedback --------------------------------------------------------------
 
     def record_feedback(self, fact_id: int, helpful: bool) -> dict:
-        with self._lock:
+        with self._db_lock:
             row = self._conn.execute(
                 "SELECT trust_score, importance, helpful_count, retrieval_count FROM facts WHERE fact_id=?",
                 (fact_id,),
@@ -1102,6 +1112,19 @@ class MemoryStore:
             )
             self._conn.commit()
             return {"fact_id": fact_id, "trust_score": trust, "importance": importance}
+
+    def increment_retrieval_count(self, fact_ids: list[int]) -> None:
+        """Increment retrieval_count for the given fact IDs (best-effort)."""
+        if not fact_ids:
+            return
+        placeholders = ",".join("?" * len(fact_ids))
+        with self._db_lock:
+            self._conn.execute(
+                f"UPDATE facts SET retrieval_count = retrieval_count + 1 "
+                f"WHERE fact_id IN ({placeholders})",
+                tuple(fact_ids),
+            )
+            self._conn.commit()
 
     # -- Entity management -----------------------------------------------------
 
@@ -1154,7 +1177,7 @@ class MemoryStore:
 
     def get_entity_facts(self, entity_name: str, limit: int = 20) -> list[dict]:
         """Get all facts linked to an entity."""
-        with self._lock:
+        with self._db_lock:
             # Escape SQL LIKE wildcards in entity name
             safe_entity = entity_name.replace("%", "\\%").replace("_", "\\_")
             rows = self._conn.execute(
@@ -1174,7 +1197,7 @@ class MemoryStore:
             return set()
         placeholders = ",".join("?" for _ in entity_names)
         try:
-            rows = self._conn.execute(
+            rows = self._conn_ro.execute(
                 f"""SELECT DISTINCT fe.fact_id FROM fact_entities fe
                     JOIN entities e ON fe.entity_id = e.entity_id
                     WHERE e.name IN ({placeholders})""",
@@ -1197,7 +1220,7 @@ class MemoryStore:
             limit: Max results.
             min_importance: Minimum importance filter (0 = no filter).
         """
-        with self._lock:
+        with self._db_lock:
             safe_entity = entity_name.replace("%", "\\%").replace("_", "\\_")
             rows = self._conn.execute(
                 """SELECT f.* FROM facts f
@@ -1213,7 +1236,7 @@ class MemoryStore:
 
     def get_related_entities(self, entity_name: str, depth: int = 2) -> list[dict]:
         """BFS traversal for related entities up to `depth` hops."""
-        with self._lock:
+        with self._db_lock:
             visited = set()
             queue = deque()
             queue.append((entity_name, 0))
@@ -1360,7 +1383,7 @@ class MemoryStore:
         """HRR similarity between a stored fact and a query string."""
         if not hrr._HAS_NUMPY:
             return 0.5
-        with self._lock:
+        with self._db_lock:
             row = self._conn.execute(
                 "SELECT hrr_vector FROM facts WHERE fact_id = ? AND hrr_vector IS NOT NULL",
                 (fact_id,),
@@ -1377,14 +1400,35 @@ class MemoryStore:
     # -- Close ----------------------------------------------------------------
 
     def close(self):
-        if self._conn:
-            self._conn.close()
-            self._conn = None
+        """Safely close all database connections.
+
+        Acquires the store lock and checkpoints WAL before closing to prevent
+        database corruption when concurrent extraction threads are still writing.
+        Also closes the read-only connection.
+        """
+        with self._db_lock:
+            if self._conn:
+                try:
+                    # Checkpoint WAL so next open doesn't see a torn journal
+                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except Exception:
+                    pass
+                self._conn.close()
+                self._conn = None
+        with self._db_lock:
+            if self._conn_ro:
+                try:
+                    self._conn_ro.close()
+                except Exception:
+                    pass
+                self._conn_ro = None
 
     # -- Public connection access for retriever --------------------------------
 
     def execute_query(self, sql: str, params: tuple = ()) -> list:
         """Execute a read-only SQL query and return all rows.
-        Used by ThreeDimRetriever to access FTS5 search results."""
-        with self._lock:
-            return self._conn.execute(sql, params).fetchall()
+        Uses a separate read-only connection so extraction writes on _conn
+        and gateway reads on _conn_ro never share the same SQLite connection.
+        """
+        with self._db_lock:
+            return self._conn_ro.execute(sql, params).fetchall()

@@ -514,6 +514,15 @@ class ThreeDimRetriever:
                         top_slice.sort(key=lambda x: x["score"], reverse=True)
                         scored = top_slice + tail
         result = scored[:limit]
+
+        # Increment retrieval_count for returned facts (best-effort)
+        returned_ids = [r["fact_id"] for r in result if r.get("fact_id")]
+        if returned_ids and hasattr(self, 'store') and self.store is not None:
+            try:
+                self.store.increment_retrieval_count(returned_ids)
+            except Exception:
+                pass
+
         if self._debug_logging:
             _elapsed = (_time.time() - _t0) * 1000
             self._dlog.debug(

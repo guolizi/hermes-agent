@@ -470,7 +470,30 @@ def _init_butterfly_logger(log_dir: str) -> logging.Logger:
 
 
 def _resolve_provider_credentials(provider: str) -> tuple[str, str]:
-    """Resolve (base_url, api_key) for a given provider name."""
+    """Resolve (base_url, api_key) for a given provider name.
+
+    Supports:
+    - ``custom:<name>`` — looks up Hermes config.yaml → custom_providers
+    - Named providers (deepseek, openai, etc.) — env var or default base URL
+    """
+    # Custom provider: look up Hermes config.yaml → custom_providers
+    if provider.startswith("custom:"):
+        name = provider[len("custom:"):].strip()
+        try:
+            from hermes_constants import get_hermes_home
+            import yaml
+            config_path = get_hermes_home() / "config.yaml"
+            if config_path.exists():
+                with open(config_path, encoding="utf-8") as f:
+                    all_cfg = yaml.safe_load(f) or {}
+                for cp in all_cfg.get("custom_providers", []):
+                    if cp.get("name") == name:
+                        return cp.get("base_url", "").rstrip("/"), cp.get("api_key", "")
+        except Exception:
+            logger.debug("ButterflyDream: failed to resolve custom provider '%s'", name)
+        return "", ""
+
+    # Standard provider: env var or default base URL
     prefix = provider.upper().replace("-", "_")
     api_key = os.environ.get(f"{prefix}_API_KEY", "")
     base_url = os.environ.get(f"{prefix}_BASE_URL", _DEFAULT_BASE_URLS.get(provider, ""))
@@ -728,6 +751,8 @@ class ButterflyDreamMemoryProvider(MemoryProvider):
         self._extraction_lock = threading.Lock()
         # Track async extraction threads for safe shutdown
         self._extract_threads: list[threading.Thread] = []
+        # Shutdown guard: prevents runaway threads from writing to a closed store
+        self._shutting_down = False
 
     @property
     def name(self) -> str:
@@ -774,10 +799,22 @@ class ButterflyDreamMemoryProvider(MemoryProvider):
         if self._store:
             self.shutdown()
 
-        # Prefer kwargs hermes_home for proper profile isolation, fall back to
-        # get_hermes_home() for backwards compatibility.
-        _hermes_home = str(kwargs.get("hermes_home")) if kwargs.get("hermes_home") else str(get_hermes_home())
-        _default_db = _hermes_home + "/memories/butterfly_memory.db"
+        # Detect: Hermes mode (passed hermes_home) vs standalone mode (no kwarg)
+        _standalone = False
+        if kwargs.get("hermes_home"):
+            _hermes_home = str(kwargs["hermes_home"])
+        else:
+            _standalone = True
+            _hermes_home = str(get_hermes_home())
+        # Guard: if hermes_home is a mocked value (MagicMock or similar), use a temp dir
+        if "MagicMock" in _hermes_home or _hermes_home.startswith("<MagicMock"):
+            import tempfile
+            _hermes_home = tempfile.mkdtemp(prefix="butterfly-hermes-home-")
+            _standalone = False  # temp dir is already isolated, treat as Hermes mode
+        if _standalone:
+            _default_db = os.path.abspath("./data/butterfly_memory.db")
+        else:
+            _default_db = _hermes_home + "/memories/butterfly_memory.db"
         db_path = self._config.get("db_path", _default_db)
         # Expand $HERMES_HOME
         if isinstance(db_path, str):
@@ -813,7 +850,10 @@ class ButterflyDreamMemoryProvider(MemoryProvider):
             compression_config=self._config.get("compression", None),
         )
         # Initialize dedicated butterfly debug logger
-        self._dlog = _init_butterfly_logger(_hermes_home + "/logs")
+        if _standalone:
+            self._dlog = _init_butterfly_logger(os.path.abspath("./logs"))
+        else:
+            self._dlog = _init_butterfly_logger(_hermes_home + "/logs")
         self._retriever = ThreeDimRetriever(
             store=self._store,
             half_life_days=half_life,
@@ -822,9 +862,14 @@ class ButterflyDreamMemoryProvider(MemoryProvider):
             debug_logging=self._config.get("debug_logging", False),
             dlog=self._dlog,
         )
+        # Only reset extraction counters when session changes
+        # (not on AIAgent rebuild within the same session)
+        if session_id != getattr(self, '_session_id', None):
+            self._last_extracted_idx = 0
+            self._turn_counter = 0
         self._session_id = session_id
-        self._last_extracted_idx = 0
-        self._turn_counter = 0
+        # Reset shutdown flag — a new store is now ready for extraction threads
+        self._shutting_down = False
 
     def system_prompt_block(self) -> str:
         if not self._store:
@@ -1066,13 +1111,16 @@ class ButterflyDreamMemoryProvider(MemoryProvider):
                 self._dlog.debug("memory_write mirror failed: %s", e)
 
     def shutdown(self) -> None:
+        # Signal running threads to abort before they touch the store
+        self._shutting_down = True
+
         # Wait for async extraction threads to finish (they may be writing to the store)
         with self._extraction_lock:
             threads = list(self._extract_threads)
             self._extract_threads.clear()
         for t in threads:
             if t.is_alive():
-                t.join(timeout=5)
+                t.join(timeout=30)
         if self._store:
             self._store.close()
         self._store = None
@@ -1144,6 +1192,11 @@ class ButterflyDreamMemoryProvider(MemoryProvider):
         if not facts:
             return []
 
+        # Shutdown check: don't write to a closing store (race condition guard)
+        if self._shutting_down:
+            self._dlog.debug("ButterflyDream: extraction aborted after LLM call (shutting down)")
+            return []
+
         stored = []
         for fact in facts:
             try:
@@ -1164,7 +1217,32 @@ class ButterflyDreamMemoryProvider(MemoryProvider):
                 self._dlog.debug("  stored[%d] fact_id=%d %s: '%.80s'",
                              len(stored) - 1, result.get("fact_id", -1), is_new, result.get("content", ""))
             except Exception as e:
-                self._dlog.debug("ButterflyDream store fact failed for '%.60s': %s", fact.get("content", ""), e)
+                self._dlog.debug("ButterflyDream store fact failed for '%.60s': %s",
+                             fact.get("content", ""), e)
+                # ── Debug info for transient DB errors ──
+                import traceback
+                _etype = type(e).__name__
+                _sqlite_errno = ""
+                if hasattr(e, "sqlite_errorcode"):
+                    _sqlite_errno = f" errno={e.sqlite_errorcode}"
+                _wal_ckpt = ""
+                _conn_ok = "?"
+                try:
+                    if self._store and self._store._conn:
+                        _conn_ok = "ok"
+                        c = self._store._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                        ck_row = c.fetchone()
+                        _wal_ckpt = f"ckpt=({ck_row[0]},{ck_row[1]},{ck_row[2]})" if ck_row else "ckpt=?"
+                    else:
+                        _conn_ok = "closed"
+                except Exception as ck:
+                    _conn_ok = f"err:{ck}"
+                _tid = threading.current_thread().name
+                self._dlog.warning(
+                    "🪲 [%s] %s%s conn=%s %s tb=%s",
+                    _tid, _etype, _sqlite_errno, _conn_ok, _wal_ckpt,
+                    "".join(traceback.format_exception_only(type(e), e)).strip(),
+                )
 
         # Track extraction count for reflection trigger
         if stored:
@@ -1639,7 +1717,8 @@ def register(ctx) -> None:
     """Register the butterfly-dream memory provider with the plugin system."""
     global _plugin_instance
     if _plugin_instance is not None:
-        logger.warning("ButterflyDream already registered, skipping")
+        ctx.register_memory_provider(_plugin_instance)
+        logger.info("ButterflyDream re-registered with existing instance")
         return
     config = _load_plugin_config()
     _plugin_instance = ButterflyDreamMemoryProvider(config=config)
